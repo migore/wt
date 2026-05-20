@@ -1,0 +1,292 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+CONFIG_FILE=".wt"
+
+die() {
+  echo "error: $*" >&2
+  exit 1
+}
+
+usage() {
+  cat >&2 <<'EOF'
+Usage: wt <command> [args]
+
+  wt new <branch>      Create a worktree with a new branch
+  wt rebase [name]    Rebase worktree branch onto local main
+  wt merge [name]     Rebase worktree branch onto main, then fast-forward merge into main
+  wt rm <name>        Remove a worktree
+
+Config file (.wt) in project root:
+
+  source=main          # worktree to copy files from (default: main)
+
+  [copy]
+  .env                 # file
+  app/assets/builds/tailwind/  # trailing / = copy directory
+
+  [mkdir]
+  public/assets        # create empty directory
+
+  [env]                # appended to .env after copying; {name} and {port} are substituted
+  PORT={port}
+  MY_VAR={name}
+
+  [setup]
+  bundle install
+  bin/rails db:create db:migrate:with_data db:seed
+
+  [teardown]
+  bin/rails db:drop
+EOF
+  exit 1
+}
+
+find_project_root() {
+  local dir="$PWD"
+  while [[ "$dir" != "/" ]]; do
+    if [[ -d "$dir/.bare" ]]; then
+      echo "$dir"
+      return 0
+    fi
+    dir="$(dirname "$dir")"
+  done
+  return 1
+}
+
+read_config() {
+  local config_path="$1"
+  COPY_FILES=()
+  MKDIR_DIRS=()
+  ENV_VARS=()
+  SETUP_CMDS=()
+  TEARDOWN_CMDS=()
+  SOURCE_WORKTREE="main"
+
+  [[ ! -f "$config_path" ]] && return 0
+
+  local section=""
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ "$line" =~ ^[[:space:]]*# ]] && continue
+    [[ -z "${line// }" ]] && continue
+
+    if [[ "$line" =~ ^\[(.+)\]$ ]]; then
+      section="${BASH_REMATCH[1]}"
+      continue
+    fi
+
+    if [[ -z "$section" && "$line" =~ ^source=(.+)$ ]]; then
+      SOURCE_WORKTREE="${BASH_REMATCH[1]}"
+      continue
+    fi
+
+    case "$section" in
+      copy)  COPY_FILES+=("$line") ;;
+      mkdir) MKDIR_DIRS+=("$line") ;;
+      env)   ENV_VARS+=("$line") ;;
+      setup)     SETUP_CMDS+=("$line") ;;
+      teardown)  TEARDOWN_CMDS+=("$line") ;;
+    esac
+  done < "$config_path"
+}
+
+generate_port() {
+  local hash
+  hash=$(printf '%s' "$1" | cksum | cut -d' ' -f1)
+  echo $(( 3000 + (hash % 1000) ))
+}
+
+generate_frontend_port() {
+  local hash
+  hash=$(printf '%s' "$1" | cksum | cut -d' ' -f1)
+  echo $(( 8000 + (hash % 1000) ))
+}
+
+cmd_new() {
+  local branch="${1:-}"
+  [[ -z "$branch" ]] && die "Usage: wt new <branch>"
+
+  local root
+  root="$(find_project_root)" || die "not in a bare worktree project (no .bare directory found)"
+
+  read_config "$root/$CONFIG_FILE"
+
+  local worktree_path="$root/$branch"
+  [[ -d "$worktree_path" ]] && die "worktree '$branch' already exists at $worktree_path"
+
+  echo "Creating worktree '$branch'..."
+  git -C "$root" worktree add "$worktree_path" -b "$branch"
+
+  if [[ ${#COPY_FILES[@]} -gt 0 ]]; then
+    local source_path="$root/$SOURCE_WORKTREE"
+    if [[ -d "$source_path" ]]; then
+      echo "Copying files from '$SOURCE_WORKTREE'..."
+      for entry in "${COPY_FILES[@]}"; do
+        if [[ "$entry" == */ ]]; then
+          local dir="${entry%/}"
+          local src="$source_path/$dir"
+          local dst_parent="$worktree_path/$(dirname "$dir")"
+          if [[ -d "$src" ]]; then
+            mkdir -p "$dst_parent"
+            cp -r "$src" "$dst_parent/"
+            echo "  + $dir/"
+          else
+            echo "  ! $dir/ (not found in source, skipping)" >&2
+          fi
+        else
+          local src="$source_path/$entry"
+          local dst="$worktree_path/$entry"
+          if [[ -f "$src" ]]; then
+            mkdir -p "$(dirname "$dst")"
+            cp "$src" "$dst"
+            echo "  + $entry"
+          else
+            echo "  ! $entry (not found in source, skipping)" >&2
+          fi
+        fi
+      done
+    else
+      echo "warning: source worktree '$SOURCE_WORKTREE' not found, skipping file copy" >&2
+    fi
+  fi
+
+  if [[ ${#ENV_VARS[@]} -gt 0 ]]; then
+    local env_file="$worktree_path/.env"
+    if [[ -f "$env_file" ]]; then
+      local port frontend_port
+      port=$(generate_port "$branch")
+      frontend_port=$(generate_frontend_port "$branch")
+      echo "Appending env vars to .env..."
+      printf '\n# wt: worktree-specific overrides\n' >> "$env_file"
+      for entry in "${ENV_VARS[@]}"; do
+        local value="${entry#*=}"
+        local key="${entry%%=*}"
+        value="${value//\{name\}/$branch}"
+        value="${value//\{port\}/$port}"
+        value="${value//\{frontend_port\}/$frontend_port}"
+        printf '%s=%s\n' "$key" "$value" >> "$env_file"
+        echo "  + $key=$value"
+      done
+    else
+      echo "warning: .env not found in new worktree, skipping env vars" >&2
+    fi
+  fi
+
+  if [[ ${#MKDIR_DIRS[@]} -gt 0 ]]; then
+    for dir in "${MKDIR_DIRS[@]}"; do
+      mkdir -p "$worktree_path/$dir"
+      echo "  mkdir $dir"
+    done
+  fi
+
+  if [[ ${#SETUP_CMDS[@]} -gt 0 ]]; then
+    echo "Running setup..."
+    for cmd in "${SETUP_CMDS[@]}"; do
+      echo "  \$ $cmd"
+      (cd "$worktree_path" && eval "$cmd")
+    done
+  fi
+
+  echo "Done: $worktree_path"
+}
+
+cmd_rebase() {
+  local name="${1:-}"
+
+  local root
+  root="$(find_project_root)" || die "not in a bare worktree project (no .bare directory found)"
+
+  if [[ -z "$name" ]]; then
+    local rel="${PWD#$root/}"
+    name="${rel%%/*}"
+    [[ -z "$name" || "$name" == "$PWD" ]] && die "could not detect worktree from current directory; pass name explicitly"
+  fi
+
+  [[ "$name" == "main" ]] && die "cannot rebase main onto itself"
+
+  local worktree_path="$root/$name"
+  [[ ! -d "$worktree_path" ]] && die "worktree '$name' not found at $worktree_path"
+
+  git -C "$root" worktree list --porcelain | grep -q "^worktree $worktree_path$" \
+    || die "'$name' is not a registered git worktree"
+
+  echo "Rebasing '$name' onto local main..."
+  git -C "$worktree_path" rebase main
+}
+
+cmd_merge() {
+  local name="${1:-}"
+
+  local root
+  root="$(find_project_root)" || die "not in a bare worktree project (no .bare directory found)"
+
+  if [[ -z "$name" ]]; then
+    local rel="${PWD#$root/}"
+    name="${rel%%/*}"
+    [[ -z "$name" || "$name" == "$PWD" ]] && die "could not detect worktree from current directory; pass name explicitly"
+  fi
+
+  [[ "$name" == "main" ]] && die "cannot merge main into itself"
+
+  local worktree_path="$root/$name"
+  [[ ! -d "$worktree_path" ]] && die "worktree '$name' not found at $worktree_path"
+
+  git -C "$root" worktree list --porcelain | grep -q "^worktree $worktree_path$" \
+    || die "'$name' is not a registered git worktree"
+
+  local branch
+  branch=$(git -C "$worktree_path" symbolic-ref --short HEAD 2>/dev/null) \
+    || die "worktree '$name' is in detached HEAD state"
+
+  local main_path="$root/main"
+  [[ ! -d "$main_path" ]] && die "main worktree not found at $main_path"
+
+  echo "Rebasing '$branch' onto main..."
+  git -C "$worktree_path" rebase main
+
+  echo "Merging '$branch' into main (fast-forward only)..."
+  git -C "$main_path" merge --ff-only "$branch"
+
+  cmd_rm "$name"
+}
+
+cmd_rm() {
+  local name="${1:-}"
+  [[ -z "$name" ]] && die "Usage: wt rm <name>"
+
+  local root
+  root="$(find_project_root)" || die "not in a bare worktree project (no .bare directory found)"
+
+  read_config "$root/$CONFIG_FILE"
+
+  local worktree_path="$root/$name"
+  [[ ! -d "$worktree_path" ]] && die "worktree '$name' not found at $worktree_path"
+
+  if [[ ${#TEARDOWN_CMDS[@]} -gt 0 ]]; then
+    echo "Running teardown..."
+    for cmd in "${TEARDOWN_CMDS[@]}"; do
+      echo "  \$ $cmd"
+      (cd "$worktree_path" && eval "$cmd")
+    done
+  fi
+
+  if git -C "$root" worktree list --porcelain | grep -q "^worktree $worktree_path$"; then
+    echo "Removing worktree '$name'..."
+    git -C "$root" worktree remove --force "$worktree_path"
+  else
+    printf "'%s' is not a registered worktree. Remove directory anyway? [y/N] " "$name"
+    read -r confirm
+    [[ "$confirm" =~ ^[Yy]$ ]] || { echo "Aborted."; exit 0; }
+    rm -rf "$worktree_path"
+  fi
+
+  echo "Done."
+}
+
+case "${1:-}" in
+  new)    cmd_new    "${@:2}" ;;
+  rebase) cmd_rebase "${@:2}" ;;
+  merge)  cmd_merge  "${@:2}" ;;
+  rm)     cmd_rm     "${@:2}" ;;
+  *)      usage ;;
+esac
