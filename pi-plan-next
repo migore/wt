@@ -1,0 +1,331 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'USAGE'
+Usage: pi-plan-next [--blueprint BLUEPRINT] [--max-steps N] [--model MODEL]
+       pi-plan-next [BLUEPRINT]
+
+Runs pi repeatedly, asking it to execute and commit exactly one blueprint step per
+iteration. Stops when pi reports the blueprint is done, blocked, or MAX_STEPS is
+reached.
+
+Options:
+  -b, --blueprint BLUEPRINT  Blueprint id/title/selector to pass to pi.
+  -m, --max-steps N          Maximum loop iterations. Defaults to $MAX_STEPS or 25.
+  -M, --model MODEL          Model pattern passed to pi via --model.
+  --fallback-model MODEL     Model to use after consecutive timeouts. Defaults to openai-codex/gpt-5.5.
+  --fallback-after N         Consecutive timeouts per step before switching to fallback model. Defaults to 3.
+  -h, --help                 Show this help.
+
+Environment:
+  MAX_STEPS                  Default max steps when --max-steps is omitted.
+  PI_BIN                     pi executable to run. Defaults to "pi".
+  PI_PLAN_NEXT_TIMEOUT_SECONDS
+                             Seconds to let one pi invocation run before killing
+                             and retrying the same step. Defaults to 300.
+USAGE
+}
+
+MAX_STEPS="${MAX_STEPS:-25}"
+PI_BIN="${PI_BIN:-pi}"
+PI_PLAN_NEXT_TIMEOUT_SECONDS="${PI_PLAN_NEXT_TIMEOUT_SECONDS:-300}"
+KILL_GRACE_SECONDS=5
+BLUEPRINT=""
+MODEL="omlx/Qwen3.6-35B-A3B-UD-MLX-4bit"
+FALLBACK_MODEL="openai-codex/gpt-5.5"
+FALLBACK_AFTER=3
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -b|--blueprint)
+      [ "$#" -ge 2 ] || { echo "Missing value for $1" >&2; exit 64; }
+      BLUEPRINT="$2"
+      shift 2
+      ;;
+    -m|--max-steps)
+      [ "$#" -ge 2 ] || { echo "Missing value for $1" >&2; exit 64; }
+      MAX_STEPS="$2"
+      shift 2
+      ;;
+    -M|--model)
+      [ "$#" -ge 2 ] || { echo "Missing value for $1" >&2; exit 64; }
+      MODEL="$2"
+      shift 2
+      ;;
+    --fallback-model)
+      [ "$#" -ge 2 ] || { echo "Missing value for $1" >&2; exit 64; }
+      FALLBACK_MODEL="$2"
+      shift 2
+      ;;
+    --fallback-after)
+      [ "$#" -ge 2 ] || { echo "Missing value for $1" >&2; exit 64; }
+      FALLBACK_AFTER="$2"
+      shift 2
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --)
+      shift
+      break
+      ;;
+    -*)
+      echo "Unknown option: $1" >&2
+      usage >&2
+      exit 64
+      ;;
+    *)
+      if [ -n "$BLUEPRINT" ]; then
+        echo "Unexpected extra argument: $1" >&2
+        usage >&2
+        exit 64
+      fi
+      BLUEPRINT="$1"
+      shift
+      ;;
+  esac
+done
+
+case "$MAX_STEPS" in
+  ''|*[!0-9]*) echo "MAX_STEPS must be a positive integer" >&2; exit 64 ;;
+esac
+[ "$MAX_STEPS" -gt 0 ] || { echo "MAX_STEPS must be greater than zero" >&2; exit 64; }
+
+case "$PI_PLAN_NEXT_TIMEOUT_SECONDS" in
+  ''|*[!0-9]*) echo "PI_PLAN_NEXT_TIMEOUT_SECONDS must be a positive integer" >&2; exit 64 ;;
+esac
+[ "$PI_PLAN_NEXT_TIMEOUT_SECONDS" -gt 0 ] || { echo "PI_PLAN_NEXT_TIMEOUT_SECONDS must be greater than zero" >&2; exit 64; }
+
+case "$FALLBACK_AFTER" in
+  ''|*[!0-9]*) echo "FALLBACK_AFTER must be a positive integer" >&2; exit 64 ;;
+esac
+[ "$FALLBACK_AFTER" -gt 0 ] || { echo "FALLBACK_AFTER must be greater than zero" >&2; exit 64; }
+
+if ! command -v "$PI_BIN" >/dev/null 2>&1; then
+  echo "Cannot find pi executable: $PI_BIN" >&2
+  exit 127
+fi
+
+if ! command -v ruby >/dev/null 2>&1; then
+  echo "Cannot find ruby, which is used to parse pi's JSON status line" >&2
+  exit 127
+fi
+
+build_prompt() {
+  if [ -n "$BLUEPRINT" ]; then
+    command="/plan-next ${BLUEPRINT}"
+  else
+    command="/plan-next"
+  fi
+
+  cat <<PROMPT
+${command}
+
+Complete exactly the task selected by /plan-next, verify it, and commit only that task's changes.
+Do not ask follow-up questions; if you cannot proceed, report BLOCKED.
+After committing, check blueprint status.
+
+Final line must be only this JSON schema:
+{"status":"CONTINUE|DONE|BLOCKED","summary":"short","blueprint":"id/title or empty","step":"completed step or empty"}
+PROMPT
+}
+
+run_pi_once() {
+  local output_file timeout_file pid watcher rc
+  pi_timed_out=0
+  output_file="$(mktemp "${TMPDIR:-/tmp}/pi-plan-next-output.XXXXXX")"
+  timeout_file="$(mktemp "${TMPDIR:-/tmp}/pi-plan-next-timeout.XXXXXX")"
+  rm -f "$timeout_file"
+
+  "$PI_BIN" "${pi_args[@]}" >"$output_file" &
+  pid=$!
+
+  (
+    sleep "$PI_PLAN_NEXT_TIMEOUT_SECONDS"
+    if kill -0 "$pid" 2>/dev/null; then
+      : >"$timeout_file"
+      echo "Pi command exceeded ${PI_PLAN_NEXT_TIMEOUT_SECONDS}s; terminating before retry." >&2
+      kill -TERM "$pid" 2>/dev/null || true
+      sleep "$KILL_GRACE_SECONDS"
+      kill -KILL "$pid" 2>/dev/null || true
+    fi
+  ) &
+  watcher=$!
+
+  if wait "$pid"; then
+    rc=0
+  else
+    rc=$?
+  fi
+
+  kill "$watcher" 2>/dev/null || true
+  wait "$watcher" 2>/dev/null || true
+
+  output="$(cat "$output_file")"
+  rm -f "$output_file"
+
+  if [ -e "$timeout_file" ]; then
+    pi_timed_out=1
+    rm -f "$timeout_file"
+    return 124
+  fi
+
+  rm -f "$timeout_file"
+  return "$rc"
+}
+
+plan_next_command_label() {
+  if [ -n "$BLUEPRINT" ]; then
+    printf '/plan-next %s' "$BLUEPRINT"
+  else
+    printf '/plan-next'
+  fi
+}
+
+render_pi_output() {
+  ruby -rjson -e '
+    def short_json(value)
+      text = value.nil? ? "" : JSON.generate(value)
+      text.length > 300 ? "#{text[0, 297]}..." : text
+    end
+
+    printed_text = false
+    STDIN.each_line do |line|
+      obj = JSON.parse(line) rescue next
+      case obj["type"]
+      when "message_update"
+        event = obj["assistantMessageEvent"] || {}
+        next unless event["type"] == "text_delta" && event["delta"]
+        print event["delta"]
+        printed_text = true
+      when "tool_execution_start"
+        puts if printed_text
+        printed_text = false
+        puts "[tool] #{obj["toolName"]} #{short_json(obj["args"])}"
+      when "tool_execution_end"
+        puts "[tool] #{obj["toolName"]} #{obj["isError"] ? "failed" : "done"}"
+      end
+    end
+    puts if printed_text
+  '
+}
+
+extract_status_json() {
+  ruby -rjson -e '
+    def text_from(value)
+      case value
+      when String
+        value
+      when Array
+        value.map { |item| text_from(item) }.join
+      when Hash
+        if value["text"].is_a?(String)
+          value["text"]
+        elsif value.key?("content")
+          text_from(value["content"])
+        else
+          ""
+        end
+      else
+        ""
+      end
+    end
+
+    candidate = nil
+    STDIN.each_line do |line|
+      raw = line.strip
+      begin
+        obj = JSON.parse(raw)
+      rescue JSON::ParserError
+        candidate = raw if raw.match?(/^\{.*"status".*\}$/)
+        next
+      end
+
+      candidate = raw if !obj.key?("type") && obj.key?("status")
+      next unless obj["message"]
+      text_from(obj["message"]).each_line do |message_line|
+        stripped = message_line.strip
+        candidate = stripped if stripped.match?(/^\{.*"status".*\}$/)
+      end
+    end
+
+    puts candidate if candidate
+  '
+}
+
+step=1
+timeout_count=0
+while [ "$step" -le "$MAX_STEPS" ]; do
+  echo "=== Pi blueprint step $step ==="
+  echo "Invoking pi --mode json for $(plan_next_command_label)"
+
+  prompt="$(build_prompt)"
+  pi_args=( --mode json "$prompt" )
+  if [ "$timeout_count" -ge "$FALLBACK_AFTER" ]; then
+    echo "Using fallback model ($FALLBACK_MODEL) after $timeout_count timeouts on step $step." >&2
+    [ -n "$FALLBACK_MODEL" ] && pi_args+=( --model "$FALLBACK_MODEL" )
+  else
+    [ -n "$MODEL" ] && pi_args+=( --model "$MODEL" )
+  fi
+  if run_pi_once; then
+    rc=0
+  else
+    rc=$?
+  fi
+
+  printf '%s\n' "$output" | render_pi_output
+
+  if [ "$pi_timed_out" -eq 1 ]; then
+    timeout_count=$((timeout_count + 1))
+    if [ "$timeout_count" -ge "$FALLBACK_AFTER" ]; then
+      echo "Step $step timed out $timeout_count times; next attempt will use fallback model." >&2
+    else
+      echo "Retrying blueprint step $step (timeout $timeout_count/$FALLBACK_AFTER)." >&2
+    fi
+    continue
+  fi
+
+  [ "$rc" -eq 0 ] || exit "$rc"
+  timeout_count=0
+
+  json_line="$(printf '%s\n' "$output" | extract_status_json)"
+
+  if [ -z "$json_line" ]; then
+    echo "Pi did not report a final JSON status line; stopping." >&2
+    exit 3
+  fi
+
+  status="$(ruby -rjson -e '
+    obj = JSON.parse(ARGV.fetch(0))
+    status = obj["status"].to_s
+    unless %w[CONTINUE DONE BLOCKED].include?(status)
+      warn "Invalid status: #{status.inspect}"
+      exit 1
+    end
+    puts status
+  ' "$json_line" 2>/dev/null)" || {
+    echo "Pi reported invalid JSON status; stopping." >&2
+    echo "Status line: $json_line" >&2
+    exit 3
+  }
+
+  case "$status" in
+    CONTINUE)
+      if [ "$step" -ge "$MAX_STEPS" ]; then
+        echo "Reached MAX_STEPS=$MAX_STEPS before blueprint reported DONE; stopping." >&2
+        exit 4
+      fi
+      step=$((step + 1))
+      ;;
+    DONE)
+      echo "Blueprint complete."
+      break
+      ;;
+    BLOCKED)
+      echo "Pi reported a blocker; stopping." >&2
+      exit 2
+      ;;
+  esac
+done
