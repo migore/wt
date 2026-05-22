@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+dir="${1:-$PWD}"
+
+# Traverse up looking for .bare (bare worktree project root)
+root="$dir"
+while [[ "$root" != "/" ]]; do
+  if [[ -d "$root/.bare" ]]; then
+    break
+  fi
+  root="$(dirname "$root")"
+done
+
+if [[ "$root" != "/" ]]; then
+  project=$(basename "$root")
+  rel="${dir#$root/}"
+  worktree="${rel%%/*}"
+  if [[ -z "$worktree" || "$worktree" == "$dir" ]]; then
+    echo "$project"
+  else
+    echo "$project - $worktree"
+  fi
+  exit 0
+fi
+
+# Fallback: check for .wt in current dir or parent
+if [[ -f "$dir/.wt" ]]; then
+  echo "$(basename "$dir")"
+  exit 0
+fi
+
+parent="$(dirname "$dir")"
+if [[ -f "$parent/.wt" ]]; then
+  echo "$(basename "$parent") - $(basename "$dir")"
+  exit 0
+fi
+
+# Last resort: git repo name + branch
+git_root=$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null)
+if [[ -n "$git_root" ]]; then
+  branch=$(git -C "$dir" rev-parse --abbrev-ref HEAD 2>/dev/null)
+  echo "$(basename "$git_root") - $branch"
+else
+  echo "$(basename "$dir")"
+fi
