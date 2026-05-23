@@ -5,6 +5,7 @@ usage() {
   cat <<'USAGE'
 Usage: pi-plan-next [--blueprint BLUEPRINT] [--max-steps N] [--model MODEL]
        pi-plan-next [BLUEPRINT]
+       pi-plan-next --analyze-stats [--stats-file FILE]
 
 Runs pi repeatedly, asking it to execute and commit exactly one blueprint step per
 iteration. Stops when pi reports the blueprint is done, blocked, or MAX_STEPS is
@@ -14,27 +15,34 @@ Options:
   -b, --blueprint BLUEPRINT  Blueprint id/title/selector to pass to pi.
   -m, --max-steps N          Maximum loop iterations. Defaults to $MAX_STEPS or 25.
   -M, --model MODEL          Model pattern passed to pi via --model.
-  --fallback-model MODEL     Model to use after consecutive timeouts. Defaults to openai-codex/gpt-5.5.
-  --fallback-after N         Consecutive timeouts per step before switching to fallback model. Defaults to 3.
+  --fallback-model MODEL     Model to use on the third attempt after two timeouts.
+                             Defaults to omlx/Qwen3.6-27B-8bit.
+  --fallback-after N         Consecutive timeouts per step before switching to fallback model. Defaults to 2.
+  --stats-file FILE          JSONL file for per-attempt timing stats.
+  --analyze-stats            Summarize the stats file and exit.
   -h, --help                 Show this help.
 
 Environment:
   MAX_STEPS                  Default max steps when --max-steps is omitted.
   PI_BIN                     pi executable to run. Defaults to "pi".
   PI_PLAN_NEXT_TIMEOUT_SECONDS
-                             Seconds to let one pi invocation run before killing
-                             and retrying the same step. Defaults to 300.
+                             Seconds to wait without pi JSON output before
+                             killing and retrying the same step. Defaults to 600.
+  PI_PLAN_NEXT_STATS_FILE    Default stats file. Defaults to
+                             ~/.local/state/pi-plan-next/runs.jsonl.
 USAGE
 }
 
 MAX_STEPS="${MAX_STEPS:-25}"
 PI_BIN="${PI_BIN:-pi}"
-PI_PLAN_NEXT_TIMEOUT_SECONDS="${PI_PLAN_NEXT_TIMEOUT_SECONDS:-300}"
+PI_PLAN_NEXT_TIMEOUT_SECONDS="${PI_PLAN_NEXT_TIMEOUT_SECONDS:-600}"
+PI_PLAN_NEXT_STATS_FILE="${PI_PLAN_NEXT_STATS_FILE:-${XDG_STATE_HOME:-$HOME/.local/state}/pi-plan-next/runs.jsonl}"
 KILL_GRACE_SECONDS=5
 BLUEPRINT=""
 MODEL="omlx/Qwen3.6-35B-A3B-UD-MLX-4bit"
-FALLBACK_MODEL="openai-codex/gpt-5.5"
-FALLBACK_AFTER=3
+FALLBACK_MODEL="omlx/Qwen3.6-27B-8bit"
+FALLBACK_AFTER=2
+ANALYZE_STATS=0
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -62,6 +70,15 @@ while [ "$#" -gt 0 ]; do
       [ "$#" -ge 2 ] || { echo "Missing value for $1" >&2; exit 64; }
       FALLBACK_AFTER="$2"
       shift 2
+      ;;
+    --stats-file)
+      [ "$#" -ge 2 ] || { echo "Missing value for $1" >&2; exit 64; }
+      PI_PLAN_NEXT_STATS_FILE="$2"
+      shift 2
+      ;;
+    --analyze-stats)
+      ANALYZE_STATS=1
+      shift
       ;;
     -h|--help)
       usage
@@ -113,6 +130,134 @@ if ! command -v ruby >/dev/null 2>&1; then
   exit 127
 fi
 
+analyze_stats() {
+  ruby -rjson -e '
+    path = ARGV.fetch(0)
+    unless File.exist?(path)
+      warn "No stats file found at #{path}"
+      exit 1
+    end
+
+    records = File.readlines(path, chomp: true).filter_map do |line|
+      JSON.parse(line)
+    rescue JSON::ParserError
+      nil
+    end
+
+    if records.empty?
+      puts "No valid stats records found."
+      exit 0
+    end
+
+    def percentile(values, pct)
+      values = values.compact.sort
+      return nil if values.empty?
+
+      values[((pct / 100.0) * (values.length - 1)).round]
+    end
+
+    def duration(seconds)
+      return "n/a" unless seconds
+      return "#{seconds.round(1)}s" if seconds < 60
+
+      "#{(seconds / 60.0).round(1)}m"
+    end
+
+    durations = records.map { |record| record["duration_seconds"] }
+    gaps = records.map { |record| record["longest_output_gap_seconds"] }
+    timeouts = records.count { |record| record["outcome"] == "TIMEOUT" }
+    failures = records.count { |record| !%w[CONTINUE DONE].include?(record["outcome"]) }
+
+    puts "Pi plan-next stats"
+    puts "Records: #{records.length}"
+    puts "Timeouts: #{timeouts}"
+    puts "Failures/blockers: #{failures}"
+    puts "Duration p50/p90/max: #{duration(percentile(durations, 50))} / #{duration(percentile(durations, 90))} / #{duration(durations.compact.max)}"
+    puts "Output quiet gap p90/max: #{duration(percentile(gaps, 90))} / #{duration(gaps.compact.max)}"
+    puts
+    puts "By task"
+
+    records.group_by { |record| record["task"] }.sort_by { |_task, group| -group.length }.first(12).each do |task, group|
+      task_durations = group.map { |record| record["duration_seconds"] }
+      task_timeouts = group.count { |record| record["outcome"] == "TIMEOUT" }
+      task_failures = group.count { |record| !%w[CONTINUE DONE].include?(record["outcome"]) }
+      puts "- #{task}: runs=#{group.length}, timeouts=#{task_timeouts}, failures=#{task_failures}, p50=#{duration(percentile(task_durations, 50))}, p90=#{duration(percentile(task_durations, 90))}"
+    end
+
+    puts
+    puts "Suggestions"
+    if gaps.compact.any?
+      suggested_idle = [percentile(gaps, 90) * 3, 60].max
+      puts "- Set PI_PLAN_NEXT_TIMEOUT_SECONDS near #{suggested_idle.round}s if these runs are representative."
+    else
+      puts "- No output-gap data yet; run more attempts before tuning idle timeout."
+    end
+    puts "- Set fallback-after lower for tasks with repeated timeouts, higher for tasks that eventually complete."
+    puts "- Investigate tasks with repeated non-timeout failures before increasing timeout values."
+  ' "$PI_PLAN_NEXT_STATS_FILE"
+}
+
+append_stats() {
+  STATS_FILE="$PI_PLAN_NEXT_STATS_FILE" \
+  STATS_TASK="$(plan_next_command_label)" \
+  STATS_BLUEPRINT="$BLUEPRINT" \
+  STATS_STEP="$step" \
+  STATS_MODEL="$active_model" \
+  STATS_FALLBACK_USED="$fallback_used" \
+  STATS_STARTED_AT="$run_started_at" \
+  STATS_FINISHED_AT="$run_finished_at" \
+  STATS_DURATION_SECONDS="$run_duration_seconds" \
+  STATS_FIRST_OUTPUT_SECONDS="$run_first_output_seconds" \
+  STATS_LAST_OUTPUT_SECONDS="$run_last_output_seconds" \
+  STATS_LONGEST_OUTPUT_GAP_SECONDS="$run_longest_output_gap_seconds" \
+  STATS_OUTPUT_LINES="$run_output_lines" \
+  STATS_OUTPUT_BYTES="$run_output_bytes" \
+  STATS_EXIT_CODE="$run_rc" \
+  STATS_TIMED_OUT="$run_timed_out" \
+  STATS_OUTCOME="$stats_outcome" \
+  STATS_STATUS_JSON="${json_line:-}" \
+  ruby -rjson -rfileutils -e '
+    def number(name)
+      value = ENV[name].to_s
+      value.empty? ? nil : value.to_f
+    end
+
+    def integer(name)
+      value = ENV[name].to_s
+      value.empty? ? nil : value.to_i
+    end
+
+    path = ENV.fetch("STATS_FILE")
+    record = {
+      "task" => ENV["STATS_TASK"],
+      "blueprint" => ENV["STATS_BLUEPRINT"],
+      "step" => integer("STATS_STEP"),
+      "model" => ENV["STATS_MODEL"],
+      "fallback_used" => ENV["STATS_FALLBACK_USED"] == "1",
+      "started_at" => ENV["STATS_STARTED_AT"],
+      "finished_at" => ENV["STATS_FINISHED_AT"],
+      "duration_seconds" => number("STATS_DURATION_SECONDS"),
+      "first_output_seconds" => number("STATS_FIRST_OUTPUT_SECONDS"),
+      "last_output_seconds" => number("STATS_LAST_OUTPUT_SECONDS"),
+      "longest_output_gap_seconds" => number("STATS_LONGEST_OUTPUT_GAP_SECONDS"),
+      "output_lines" => integer("STATS_OUTPUT_LINES"),
+      "output_bytes" => integer("STATS_OUTPUT_BYTES"),
+      "exit_code" => integer("STATS_EXIT_CODE"),
+      "timed_out" => ENV["STATS_TIMED_OUT"] == "1",
+      "outcome" => ENV["STATS_OUTCOME"],
+      "status_json" => ENV["STATS_STATUS_JSON"].to_s.empty? ? nil : ENV["STATS_STATUS_JSON"]
+    }
+
+    FileUtils.mkdir_p(File.dirname(path))
+    File.open(path, "a") { |file| file.puts(JSON.generate(record)) }
+  '
+}
+
+if [ "$ANALYZE_STATS" -eq 1 ]; then
+  analyze_stats
+  exit 0
+fi
+
 build_prompt() {
   if [ -n "$BLUEPRINT" ]; then
     command="/plan-next ${BLUEPRINT}"
@@ -133,24 +278,54 @@ PROMPT
 }
 
 run_pi_once() {
-  local output_file timeout_file pid watcher rc
+  local output_file timeout_file metrics_file pid watcher rc start_epoch now last_activity last_size current_size gap
   pi_timed_out=0
+  run_started_at="$(ruby -rtime -e 'puts Time.now.utc.iso8601')"
+  start_epoch="$(date +%s)"
+  run_first_output_seconds=""
+  run_last_output_seconds=""
+  run_longest_output_gap_seconds=0
   output_file="$(mktemp "${TMPDIR:-/tmp}/pi-plan-next-output.XXXXXX")"
   timeout_file="$(mktemp "${TMPDIR:-/tmp}/pi-plan-next-timeout.XXXXXX")"
+  metrics_file="$(mktemp "${TMPDIR:-/tmp}/pi-plan-next-metrics.XXXXXX")"
   rm -f "$timeout_file"
+  rm -f "$metrics_file"
 
   "$PI_BIN" "${pi_args[@]}" >"$output_file" &
   pid=$!
 
   (
-    sleep "$PI_PLAN_NEXT_TIMEOUT_SECONDS"
-    if kill -0 "$pid" 2>/dev/null; then
-      : >"$timeout_file"
-      echo "Pi command exceeded ${PI_PLAN_NEXT_TIMEOUT_SECONDS}s; terminating before retry." >&2
-      kill -TERM "$pid" 2>/dev/null || true
-      sleep "$KILL_GRACE_SECONDS"
-      kill -KILL "$pid" 2>/dev/null || true
-    fi
+    local first_output_seconds="" last_output_seconds="" longest_output_gap_seconds=0
+    last_activity="$start_epoch"
+    last_size=0
+    while kill -0 "$pid" 2>/dev/null; do
+      sleep 1
+      now="$(date +%s)"
+      current_size="$(wc -c <"$output_file" | tr -d ' ')"
+      if [ "$current_size" -gt "$last_size" ]; then
+        if [ -z "$first_output_seconds" ]; then
+          first_output_seconds=$((now - start_epoch))
+        fi
+        gap=$((now - last_activity))
+        if [ "$gap" -gt "$longest_output_gap_seconds" ]; then
+          longest_output_gap_seconds="$gap"
+        fi
+        last_output_seconds=$((now - start_epoch))
+        last_activity="$now"
+        last_size="$current_size"
+        printf '%s\n%s\n%s\n' "$first_output_seconds" "$last_output_seconds" "$longest_output_gap_seconds" >"$metrics_file"
+      fi
+
+      if [ $((now - last_activity)) -ge "$PI_PLAN_NEXT_TIMEOUT_SECONDS" ]; then
+        : >"$timeout_file"
+        echo "Pi produced no JSON output for ${PI_PLAN_NEXT_TIMEOUT_SECONDS}s; terminating before retry." >&2
+        kill -TERM "$pid" 2>/dev/null || true
+        sleep "$KILL_GRACE_SECONDS"
+        kill -KILL "$pid" 2>/dev/null || true
+        break
+      fi
+    done
+    printf '%s\n%s\n%s\n' "$first_output_seconds" "$last_output_seconds" "$longest_output_gap_seconds" >"$metrics_file"
   ) &
   watcher=$!
 
@@ -164,14 +339,27 @@ run_pi_once() {
   wait "$watcher" 2>/dev/null || true
 
   output="$(cat "$output_file")"
+  run_finished_at="$(ruby -rtime -e 'puts Time.now.utc.iso8601')"
+  run_duration_seconds=$(($(date +%s) - start_epoch))
+  if [ -e "$metrics_file" ]; then
+    run_first_output_seconds="$(sed -n '1p' "$metrics_file")"
+    run_last_output_seconds="$(sed -n '2p' "$metrics_file")"
+    run_longest_output_gap_seconds="$(sed -n '3p' "$metrics_file")"
+  fi
+  run_output_lines="$(wc -l <"$output_file" | tr -d ' ')"
+  run_output_bytes="$(wc -c <"$output_file" | tr -d ' ')"
+  run_rc="$rc"
   rm -f "$output_file"
+  rm -f "$metrics_file"
 
   if [ -e "$timeout_file" ]; then
     pi_timed_out=1
+    run_timed_out=1
     rm -f "$timeout_file"
     return 124
   fi
 
+  run_timed_out=0
   rm -f "$timeout_file"
   return "$rc"
 }
@@ -263,11 +451,16 @@ while [ "$step" -le "$MAX_STEPS" ]; do
 
   prompt="$(build_prompt)"
   pi_args=( --mode json "$prompt" )
+  json_line=""
+  fallback_used=0
   if [ "$timeout_count" -ge "$FALLBACK_AFTER" ]; then
     echo "Using fallback model ($FALLBACK_MODEL) after $timeout_count timeouts on step $step." >&2
-    [ -n "$FALLBACK_MODEL" ] && pi_args+=( --model "$FALLBACK_MODEL" )
+    active_model="$FALLBACK_MODEL"
+    fallback_used=1
+    [ -n "$active_model" ] && pi_args+=( --model "$active_model" )
   else
-    [ -n "$MODEL" ] && pi_args+=( --model "$MODEL" )
+    active_model="$MODEL"
+    [ -n "$active_model" ] && pi_args+=( --model "$active_model" )
   fi
   if run_pi_once; then
     rc=0
@@ -278,6 +471,8 @@ while [ "$step" -le "$MAX_STEPS" ]; do
   printf '%s\n' "$output" | render_pi_output
 
   if [ "$pi_timed_out" -eq 1 ]; then
+    stats_outcome="TIMEOUT"
+    append_stats
     timeout_count=$((timeout_count + 1))
     if [ "$timeout_count" -ge "$FALLBACK_AFTER" ]; then
       echo "Step $step timed out $timeout_count times; next attempt will use fallback model." >&2
@@ -287,12 +482,18 @@ while [ "$step" -le "$MAX_STEPS" ]; do
     continue
   fi
 
-  [ "$rc" -eq 0 ] || exit "$rc"
+  if [ "$rc" -ne 0 ]; then
+    stats_outcome="ERROR"
+    append_stats
+    exit "$rc"
+  fi
   timeout_count=0
 
   json_line="$(printf '%s\n' "$output" | extract_status_json)"
 
   if [ -z "$json_line" ]; then
+    stats_outcome="MISSING_STATUS"
+    append_stats
     echo "Pi did not report a final JSON status line; stopping." >&2
     exit 3
   fi
@@ -306,10 +507,15 @@ while [ "$step" -le "$MAX_STEPS" ]; do
     end
     puts status
   ' "$json_line" 2>/dev/null)" || {
+    stats_outcome="INVALID_STATUS"
+    append_stats
     echo "Pi reported invalid JSON status; stopping." >&2
     echo "Status line: $json_line" >&2
     exit 3
   }
+
+  stats_outcome="$status"
+  append_stats
 
   case "$status" in
     CONTINUE)
