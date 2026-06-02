@@ -15,7 +15,7 @@ Usage: wt <command> [args]
   wt new <branch>      Create a worktree with a new branch
   wt rebase [name]    Rebase worktree branch onto local main
   wt merge [name]     Rebase worktree branch onto main, then fast-forward merge into main
-  wt rm <name>        Remove a worktree
+  wt rm [name]        Remove a worktree (defaults to current directory name)
 
 Config file (.wt) in project root:
 
@@ -273,10 +273,15 @@ cmd_merge() {
 
 cmd_rm() {
   local name="${1:-}"
-  [[ -z "$name" ]] && die "Usage: wt rm <name>"
 
   local root
   root="$(find_project_root)" || die "not in a bare worktree project (no .bare directory found)"
+
+  if [[ -z "$name" ]]; then
+    local rel="${PWD#$root/}"
+    name="${rel%%/*}"
+    [[ -z "$name" || "$name" == "$PWD" ]] && die "could not detect worktree from current directory; pass name explicitly"
+  fi
 
   read_config "$root/$CONFIG_FILE"
 
