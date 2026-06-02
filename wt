@@ -28,8 +28,9 @@ Config file (.wt) in project root:
   [mkdir]
   public/assets        # create empty directory
 
-  [env]                # appended to .env after copying; {name} and {port} are substituted
-  PORT={port}
+  [env]                # appended to .env after copying; {name}, {port}, {frontend_port} are substituted
+  PORT={port}                        # unconstrained: hash-derived
+  PORT={port:3010,3020,3030}         # constrained: picks from this list
   MY_VAR={name}
 
   [setup]
@@ -102,6 +103,14 @@ generate_frontend_port() {
   echo $(( 8000 + (hash % 1000) ))
 }
 
+pick_from_list() {
+  local branch="$1" list="$2"
+  local hash
+  hash=$(printf '%s' "$branch" | cksum | cut -d' ' -f1)
+  IFS=',' read -ra opts <<< "$list"
+  echo "${opts[$(( hash % ${#opts[@]} ))]}"
+}
+
 cmd_new() {
   local branch="${1:-}"
   [[ -z "$branch" ]] && die "Usage: wt new <branch>"
@@ -162,8 +171,20 @@ cmd_new() {
         local value="${entry#*=}"
         local key="${entry%%=*}"
         value="${value//\{name\}/$branch}"
-        value="${value//\{port\}/$port}"
-        value="${value//\{frontend_port\}/$frontend_port}"
+        if [[ "$value" =~ \{port:([^}]+)\} ]]; then
+          local port_list="${BASH_REMATCH[1]}"
+          local cv; cv=$(pick_from_list "$branch" "$port_list")
+          value="${value//\{port:$port_list\}/$cv}"
+        else
+          value="${value//\{port\}/$port}"
+        fi
+        if [[ "$value" =~ \{frontend_port:([^}]+)\} ]]; then
+          local fp_list="${BASH_REMATCH[1]}"
+          local cv; cv=$(pick_from_list "$branch" "$fp_list")
+          value="${value//\{frontend_port:$fp_list\}/$cv}"
+        else
+          value="${value//\{frontend_port\}/$frontend_port}"
+        fi
         printf '%s=%s\n' "$key" "$value" >> "$env_file"
         echo "  + $key=$value"
       done

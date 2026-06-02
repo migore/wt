@@ -9,7 +9,8 @@ Usage: pi-plan-next [--blueprint BLUEPRINT] [--max-steps N] [--model MODEL]
 
 Runs pi repeatedly, asking it to execute and commit exactly one blueprint step per
 iteration. Stops when pi reports the blueprint is done, blocked, or MAX_STEPS is
-reached.
+reached. When the blueprint is done, runs a read-only code review with
+omlx/Qwen3.6-27B-8bit and prints any issues found.
 
 Options:
   -b, --blueprint BLUEPRINT  Blueprint id/title/selector to pass to pi.
@@ -26,7 +27,7 @@ Environment:
   MAX_STEPS                  Default max steps when --max-steps is omitted.
   PI_BIN                     pi executable to run. Defaults to "pi".
   PI_PLAN_NEXT_TIMEOUT_SECONDS
-                             Seconds to wait without pi JSON output before
+                             Seconds to wait without pi output before
                              killing and retrying the same step. Defaults to 600.
   PI_PLAN_NEXT_STATS_FILE    Default stats file. Defaults to
                              ~/.local/state/pi-plan-next/runs.jsonl.
@@ -41,6 +42,7 @@ KILL_GRACE_SECONDS=5
 BLUEPRINT=""
 MODEL="omlx/Qwen3.6-35B-A3B-UD-MLX-4bit"
 FALLBACK_MODEL="omlx/Qwen3.6-27B-8bit"
+REVIEW_MODEL="omlx/Qwen3.6-27B-8bit"
 FALLBACK_AFTER=2
 ANALYZE_STATS=0
 
@@ -128,6 +130,11 @@ fi
 if ! command -v ruby >/dev/null 2>&1; then
   echo "Cannot find ruby, which is used to parse pi's JSON status line" >&2
   exit 127
+fi
+
+REVIEW_BASE=""
+if command -v git >/dev/null 2>&1 && git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  REVIEW_BASE="$(git rev-parse --verify HEAD 2>/dev/null || true)"
 fi
 
 analyze_stats() {
@@ -269,6 +276,8 @@ build_prompt() {
 ${command}
 
 Complete exactly the task selected by /plan-next, verify it, and commit only that task's changes.
+After /plan-next selects the task, read the blueprint state.json file before editing.
+Treat state.json as the source of truth for the files you must read; read the files listed there before making changes.
 Do not ask follow-up questions; if you cannot proceed, report BLOCKED.
 After committing, check blueprint status.
 
@@ -318,7 +327,7 @@ run_pi_once() {
 
       if [ $((now - last_activity)) -ge "$PI_PLAN_NEXT_TIMEOUT_SECONDS" ]; then
         : >"$timeout_file"
-        echo "Pi produced no JSON output for ${PI_PLAN_NEXT_TIMEOUT_SECONDS}s; terminating before retry." >&2
+        echo "Pi produced no output for ${PI_PLAN_NEXT_TIMEOUT_SECONDS}s; terminating before retry." >&2
         kill -TERM "$pid" 2>/dev/null || true
         sleep "$KILL_GRACE_SECONDS"
         kill -KILL "$pid" 2>/dev/null || true
@@ -381,7 +390,13 @@ render_pi_output() {
 
     printed_text = false
     STDIN.each_line do |line|
-      obj = JSON.parse(line) rescue next
+      begin
+        obj = JSON.parse(line)
+      rescue JSON::ParserError
+        print line
+        printed_text = false
+        next
+      end
       case obj["type"]
       when "message_update"
         event = obj["assistantMessageEvent"] || {}
@@ -394,6 +409,8 @@ render_pi_output() {
         puts "[tool] #{obj["toolName"]} #{short_json(obj["args"])}"
       when "tool_execution_end"
         puts "[tool] #{obj["toolName"]} #{obj["isError"] ? "failed" : "done"}"
+      else
+        print line
       end
     end
     puts if printed_text
@@ -443,14 +460,71 @@ extract_status_json() {
   '
 }
 
+build_code_review_prompt() {
+  if [ -n "$REVIEW_BASE" ]; then
+    cat <<PROMPT
+The blueprint run completed.
+
+Review the code changes made during this pi-plan-next run.
+Base commit before the run: $REVIEW_BASE
+Review range: $REVIEW_BASE..HEAD
+
+Do not modify files. Do not commit.
+Read the blueprint state.json file first. Treat its file list as the source of truth for the files to inspect during review.
+Focus on correctness bugs, regressions, missed requirements, unsafe edge cases, and test gaps.
+Return findings first as a numbered issue list. For each issue include severity, file:line, problem, impact, and suggested fix.
+If there are no blocking issues, say exactly: No blocking issues found.
+PROMPT
+  else
+    cat <<'PROMPT'
+The blueprint run completed.
+
+Review the current repository changes for the completed blueprint.
+Do not modify files. Do not commit.
+Read the blueprint state.json file first. Treat its file list as the source of truth for the files to inspect during review.
+Focus on correctness bugs, regressions, missed requirements, unsafe edge cases, and test gaps.
+Return findings first as a numbered issue list. For each issue include severity, file:line, problem, impact, and suggested fix.
+If there are no blocking issues, say exactly: No blocking issues found.
+PROMPT
+  fi
+}
+
+run_code_review() {
+  local review_prompt rc
+
+  echo "=== Pi code review ==="
+  echo "Invoking pi for code review with $REVIEW_MODEL"
+
+  review_prompt="$(build_code_review_prompt)"
+  pi_args=( "$review_prompt" --model "$REVIEW_MODEL" )
+
+  if run_pi_once; then
+    rc=0
+  else
+    rc=$?
+  fi
+
+  printf '%s\n' "$output" | render_pi_output
+
+  if [ "$pi_timed_out" -eq 1 ]; then
+    echo "Code review timed out." >&2
+    exit 124
+  fi
+
+  if [ "$rc" -ne 0 ]; then
+    echo "Code review failed." >&2
+    exit "$rc"
+  fi
+}
+
 step=1
 timeout_count=0
 while [ "$step" -le "$MAX_STEPS" ]; do
   echo "=== Pi blueprint step $step ==="
-  echo "Invoking pi --mode json for $(plan_next_command_label)"
+  echo "Invoking pi for $(plan_next_command_label)"
 
   prompt="$(build_prompt)"
-  pi_args=( --mode json "$prompt" )
+  pi_args=( "$prompt" )
   json_line=""
   fallback_used=0
   if [ "$timeout_count" -ge "$FALLBACK_AFTER" ]; then
@@ -527,6 +601,7 @@ while [ "$step" -le "$MAX_STEPS" ]; do
       ;;
     DONE)
       echo "Blueprint complete."
+      run_code_review
       break
       ;;
     BLOCKED)
