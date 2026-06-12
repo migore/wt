@@ -12,10 +12,11 @@ usage() {
   cat >&2 <<'EOF'
 Usage: wt <command> [args]
 
-  wt new <branch>      Create a worktree with a new branch
-  wt rebase [name]    Rebase worktree branch onto local main
-  wt merge [name]     Rebase worktree branch onto main, then fast-forward merge into main
-  wt rm [name]        Remove a worktree (defaults to current directory name)
+  wt setup <url> [dir]  Set up a project with the bare repo worktrees pattern
+  wt new <branch>       Create a worktree with a new branch
+  wt rebase [name]      Rebase worktree branch onto local main
+  wt merge [name]       Rebase worktree branch onto main, then fast-forward merge into main
+  wt rm [name]          Remove a worktree (defaults to current directory name)
 
 Config file (.wt) in project root:
 
@@ -109,6 +110,38 @@ pick_from_list() {
   hash=$(printf '%s' "$branch" | cksum | cut -d' ' -f1)
   IFS=',' read -ra opts <<< "$list"
   echo "${opts[$(( hash % ${#opts[@]} ))]}"
+}
+
+cmd_setup() {
+  local url="${1:-}"
+  [[ -z "$url" ]] && die "Usage: wt setup <url> [directory]"
+
+  local dir="${2:-}"
+  if [[ -z "$dir" ]]; then
+    dir=$(basename "$url" .git)
+    [[ -z "$dir" ]] && die "could not infer directory from URL; pass one explicitly"
+  fi
+
+  [[ -e "$dir" ]] && die "directory '$dir' already exists"
+
+  mkdir -p "$dir"
+  local target
+  target="$(cd "$dir" && pwd)"
+
+  echo "Cloning bare repository..."
+  git clone --bare "$url" "$target/.bare"
+
+  git -C "$target/.bare" config remote.origin.fetch "+refs/heads/*:refs/remotes/origin/*"
+
+  echo "gitdir: ./.bare" > "$target/.git"
+
+  local default_branch
+  default_branch=$(git -C "$target/.bare" symbolic-ref --short HEAD 2>/dev/null || echo "main")
+
+  echo "Adding '$default_branch' worktree..."
+  git -C "$target" worktree add "$target/$default_branch"
+
+  echo "Done: $target"
 }
 
 cmd_new() {
@@ -310,6 +343,7 @@ cmd_rm() {
 }
 
 case "${1:-}" in
+  setup)  cmd_setup  "${@:2}" ;;
   new)    cmd_new    "${@:2}" ;;
   rebase) cmd_rebase "${@:2}" ;;
   merge)  cmd_merge  "${@:2}" ;;
