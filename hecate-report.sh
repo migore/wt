@@ -31,6 +31,12 @@ case "$event" in
     # New user turn: clear any markers leaked by a prior turn, then report working.
     rm -rf "$inflight_dir"
     status="working" ;;
+  active)
+    # Tool activity (PreToolUse): work resumed. Answering an in-conversation
+    # question or approving a permission prompt does NOT fire UserPromptSubmit,
+    # so the card would otherwise stay stuck on needs_input. Report working
+    # without clearing in-flight subagent markers.
+    status="working" ;;
   subagent_start)
     mkdir -p "$inflight_dir"; : > "$inflight_dir/$$.$RANDOM"
     status="working" ;;
