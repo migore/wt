@@ -63,7 +63,10 @@ esac
 
 [ -z "$status" ] && exit 0
 
-label="${cwd##*/}"
+# Label: the tmux window name this session runs in; fall back to cwd basename.
+label=""
+[ -n "$TMUX_PANE" ] && label="$(tmux display-message -p -t "$TMUX_PANE" '#W' 2>/dev/null)"
+[ -z "$label" ] && label="${cwd##*/}"
 [ -z "$label" ] && label="claude"
 
 # Derive project context from cwd (wt convention: <root with .bare>/<worktree>/...).
