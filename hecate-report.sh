@@ -46,11 +46,11 @@ case "$event" in
     status="working" ;;
   idle)
     # Stop hook: genuinely idle only if no subagent is still running.
-    [ "$(inflight_count)" -gt 0 ] && status="working" || status="needs_input" ;;
+    [ "$(inflight_count)" -gt 0 ] && status="working" || status="finished" ;;
   notification)
     case "$notif_type" in
       permission_prompt|elicitation_dialog) status="needs_input" ;;
-      idle_prompt) [ "$(inflight_count)" -gt 0 ] && status="working" || status="needs_input" ;;
+      idle_prompt) [ "$(inflight_count)" -gt 0 ] && status="working" || status="finished" ;;
       *) exit 0 ;;  # auth_success, elicitation_complete, etc. — nothing to report
     esac ;;
   shutdown)
