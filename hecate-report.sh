@@ -63,6 +63,13 @@ esac
 
 [ -z "$status" ] && exit 0
 
+# Computer: a stable, human-friendly identifier for the machine this session
+# runs on, so reports from different computers are distinguishable in the card.
+# Prefer the friendly ComputerName (e.g. "Ygor's Mac mini"); fall back to hostname.
+computer="$(scutil --get ComputerName 2>/dev/null)"
+[ -z "$computer" ] && computer="$(hostname -s 2>/dev/null)"
+[ -z "$computer" ] && computer="$(hostname 2>/dev/null)"
+
 # Label: the tmux window name this session runs in; fall back to cwd basename.
 label=""
 [ -n "$TMUX_PANE" ] && label="$(tmux display-message -p -t "$TMUX_PANE" '#W' 2>/dev/null)"
@@ -106,11 +113,13 @@ payload="$(jq -nc \
   --arg branch "$branch" \
   --arg worktree "$cwd" \
   --arg terminal "$terminal" \
+  --arg computer "$computer" \
   '{agent_id: $agent_id, source: $source, status: $status, label: $label, message: $message}
    + (if $repository != "" then {repository: $repository} else {} end)
    + (if $branch     != "" then {branch: $branch}         else {} end)
    + (if $worktree   != "" then {worktree: $worktree}     else {} end)
-   + (if $terminal   != "" then {terminal: $terminal}     else {} end)')"
+   + (if $terminal   != "" then {terminal: $terminal}     else {} end)
+   + (if $computer   != "" then {computer: $computer}     else {} end)')"
 
 if [ "$status" = "shutdown" ]; then
   # Synchronous: a backgrounded child can be killed before it POSTs on teardown.
