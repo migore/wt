@@ -12,8 +12,8 @@ and the tmux pane, and POSTs (non-blocking) to Hecate:
 
 ```json
 {
-  "agent_id": "claude-<session_id>",
-  "source": "claude",
+  "agent_id": "<source>-<session_id>",
+  "source": "claude | pi | ...",
   "status": "working | needs_input | finished",
   "label": "<project folder name>",
   "message": "<event>: <status> (<cwd>)",
@@ -47,6 +47,29 @@ endpoint="http://ygors-mac-mini.local:3000/api/v1/reports"
 ```
 
 Change that line if Hecate moves.
+
+## Other agents
+
+The script is not Claude-specific: any agent that can feed it hook-shaped JSON on
+stdin can report through it. Set `HECATE_SOURCE` to tag the reports — it becomes
+the `source` and the `agent_id` prefix, and Hecate keys agents on
+`(source, agent_id)`, so each agent gets its own cards and its own bundled
+artwork. Unset means `claude`.
+
+pi has no declarative hook config, so it reports from an extension
+(`~/.pi/agent/extensions/hecate.ts`) that maps pi's lifecycle events onto the
+same script and spawns it with `HECATE_SOURCE=pi`:
+
+| pi event           | script arg  | Status                            |
+| ------------------ | ----------- | --------------------------------- |
+| `agent_start`      | `working`   | `working`                         |
+| `tool_call`        | `active`    | `working` (re-assert)             |
+| `tool_result`      | `active`    | `working`                         |
+| `agent_end`        | `finished`  | `finished`                        |
+| `session_shutdown` | `shutdown`  | `shutdown` (awaited, not backgrounded) |
+
+pi surfaces no permission-prompt event, so `needs_input` has no pi equivalent;
+the card rests on `finished` between turns.
 
 ## Install
 

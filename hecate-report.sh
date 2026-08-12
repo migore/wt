@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Reports Claude Code session status to Hecate. Invoked by global hooks.
+# Reports coding agent session status to Hecate. Invoked by global hooks.
 # Usage: hecate-report.sh <event>
 #   Explicit status : working | needs_input | finished | shutdown
 #   Computed status : subagent_start | subagent_stop | idle | notification
@@ -7,6 +7,13 @@
 
 event="${1:-working}"
 endpoint="http://ygors-mac-mini.local:3000/api/v1/reports"
+
+# Source: which agent is reporting. Claude Code invokes this script straight from
+# ~/.claude/settings.json and leaves it unset; the pi extension exports
+# HECATE_SOURCE=pi. Hecate keys agents on (source, agent_id), so tagging the
+# source keeps pi sessions on their own cards — and picks the pi artwork for a
+# card with no icon of its own.
+source="${HECATE_SOURCE:-claude}"
 
 input="$(cat)"
 session_id="$(printf '%s' "$input" | jq -r '.session_id // "unknown"' 2>/dev/null)"
@@ -92,7 +99,7 @@ fi
 [ -n "$HECATE_ICON" ] && icon="$HECATE_ICON"
 
 [ -z "$label" ] && label="${cwd##*/}"
-[ -z "$label" ] && label="claude"
+[ -z "$label" ] && label="$source"
 
 # Derive project context from cwd (wt convention: <root with .bare>/<worktree>/...).
 repository=""; branch=""; terminal=""
@@ -147,8 +154,8 @@ if [ -z "$icon" ]; then
 fi
 
 payload="$(jq -nc \
-  --arg agent_id "claude-${session_id}" \
-  --arg source "claude" \
+  --arg agent_id "${source}-${session_id}" \
+  --arg source "$source" \
   --arg status "$status" \
   --arg label "$label" \
   --arg message "${hook_event:-$event}: ${status} (${cwd:-unknown})" \
