@@ -73,6 +73,24 @@ computer="$(scutil --get ComputerName 2>/dev/null)"
 # Label: the tmux window name this session runs in; fall back to cwd basename.
 label=""
 [ -n "$TMUX_PANE" ] && label="$(tmux display-message -p -t "$TMUX_PANE" '#W' 2>/dev/null)"
+
+# Icon: a leading glyph on the window name — "🦊 hecate" reports icon 🦊 with
+# label "hecate" — so renaming the tmux window is the only step needed to mark a
+# session. The leading field counts as a glyph when it carries no ASCII
+# alphanumerics. $HECATE_ICON overrides, for sessions not running under tmux.
+icon=""
+if [ -n "$label" ]; then
+  first="${label%% *}"
+  rest="${label#* }"
+  case "$first" in
+    *[A-Za-z0-9]*) ;;                       # ordinary word, not a glyph
+    "") ;;                                  # leading whitespace
+    "$label") icon="$first"; label="" ;;    # window named with a glyph and nothing else
+    *) icon="$first"; label="$rest" ;;
+  esac
+fi
+[ -n "$HECATE_ICON" ] && icon="$HECATE_ICON"
+
 [ -z "$label" ] && label="${cwd##*/}"
 [ -z "$label" ] && label="claude"
 
@@ -114,12 +132,14 @@ payload="$(jq -nc \
   --arg worktree "$cwd" \
   --arg terminal "$terminal" \
   --arg computer "$computer" \
+  --arg icon "$icon" \
   '{agent_id: $agent_id, source: $source, status: $status, label: $label, message: $message}
    + (if $repository != "" then {repository: $repository} else {} end)
    + (if $branch     != "" then {branch: $branch}         else {} end)
    + (if $worktree   != "" then {worktree: $worktree}     else {} end)
    + (if $terminal   != "" then {terminal: $terminal}     else {} end)
-   + (if $computer   != "" then {computer: $computer}     else {} end)')"
+   + (if $computer   != "" then {computer: $computer}     else {} end)
+   + (if $icon       != "" then {icon: $icon}             else {} end)')"
 
 if [ "$status" = "shutdown" ]; then
   # Synchronous: a backgrounded child can be killed before it POSTs on teardown.
