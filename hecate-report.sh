@@ -121,6 +121,31 @@ if [ -n "$repository" ]; then
   fi
 fi
 
+# Icon fallback: with nothing set explicitly, derive a stable glyph from the
+# worktree path. The same worktree draws the same icon on every machine and in
+# every session, so there is nothing to configure and nothing to remember — but
+# a window glyph or $HECATE_ICON still wins when you want to choose.
+if [ -z "$icon" ]; then
+  icon_key=""
+  if [ -d "$root/.bare" ] && [ -n "$worktree" ]; then
+    icon_key="$root/$worktree"
+  elif [ -n "$cwd" ]; then
+    icon_key="$(git -C "$cwd" rev-parse --show-toplevel 2>/dev/null)"
+    [ -z "$icon_key" ] && icon_key="$cwd"
+  fi
+
+  if [ -n "$icon_key" ]; then
+    # Single-codepoint emoji only: the dashboard stores at most 2 grapheme
+    # clusters, and ZWJ sequences burn the budget for no visual gain.
+    palette=(🦊 🐙 🦑 🦩 🦔 🦉 🦋 🐝 🐳 🐬 🦭 🐢 🦎 🐺 🦡 🦫 🦦 🐧 🦜 🦢 \
+             🍄 🍇 🍉 🍊 🍋 🍌 🍍 🥝 🥑 🥕 🌽 🥐 🧃 🍿 🍪 🧁 \
+             🌵 🌻 🌲 🍁 🌊 🌈 🌙 🪐 🌟 🍀 🌷 🌴 🎈 🎨 🎭 🧩 \
+             🚀 🛸 🧲 🔮 🗿 🪁 🎺 🥁 🧭 🪄 🛼 🧊)
+    sum="$(printf '%s' "$icon_key" | cksum | cut -d' ' -f1)"
+    icon="${palette[$(( sum % ${#palette[@]} ))]}"
+  fi
+fi
+
 payload="$(jq -nc \
   --arg agent_id "claude-${session_id}" \
   --arg source "claude" \
