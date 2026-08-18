@@ -40,13 +40,18 @@ Each field is sent only when non-empty, so the four stay optional.
 It backgrounds the `curl` with a 2s timeout and always exits 0, so a slow or
 unreachable Hecate never blocks or fails a turn.
 
-The endpoint is hardcoded near the top of the script:
+The endpoint is set near the top of the script, overridable by `HECATE_ENDPOINT`:
 
 ```sh
-endpoint="http://ygors-mac-mini.local:3000/api/v1/reports"
+endpoint="${HECATE_ENDPOINT:-http://macmini.local:3000/api/v1/reports}"
 ```
 
-Change that line if Hecate moves.
+Change that line, or export `HECATE_ENDPOINT`, if Hecate moves.
+
+Because the `curl` is backgrounded with its output discarded and the script
+always exits 0, an endpoint that no longer resolves fails invisibly: hooks keep
+firing and no card ever appears. Renaming the machine changes its `.local` name,
+so re-check this line after a rename.
 
 ## Other agents
 

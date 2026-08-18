@@ -6,7 +6,12 @@
 # Reads hook JSON from stdin (session_id, cwd, hook_event_name, notification_type).
 
 event="${1:-working}"
-endpoint="http://ygors-mac-mini.local:3000/api/v1/reports"
+# Endpoint: set HECATE_ENDPOINT to point somewhere else. The default is the Mac
+# mini's mDNS name, which changes when the computer is renamed — and a stale
+# name fails silently, because curl is backgrounded with its output discarded
+# and this script always exits 0. If reports stop arriving, check that this host
+# still resolves before looking anywhere else.
+endpoint="${HECATE_ENDPOINT:-http://macmini.local:3000/api/v1/reports}"
 
 # Source: which agent is reporting. Claude Code invokes this script straight from
 # ~/.claude/settings.json and leaves it unset; the pi extension exports
